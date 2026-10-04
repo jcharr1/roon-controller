@@ -662,7 +662,7 @@ app.post('/api/profiles/select', (req, res) => {
 
 // EXPERIMENT: POST /api/experiment/profile-queue { zone_id, profile, title, artist }
 // Selects `profile` and queues a TIDAL track entirely within ONE browse-hierarchy
-// session (Settings > Profile, then TIDAL > Search > Tracks > Queue), to test
+// session (Settings > Profile, then Library > Search > Tracks > Queue), to test
 // whether Roon's "Added by" follows the browse session's profile.
 app.post('/api/experiment/profile-queue', (req, res) => {
   if (!requireCore(res)) return;
@@ -684,14 +684,16 @@ app.post('/api/experiment/profile-queue', (req, res) => {
     steps.push({ profile_selected: sel.selected, settings_after: (sel.actions || []).map(a => `${a.title}: ${a.subtitle}`) });
     nav({ pop_all: true }, (err, _, root) => {
       if (err) return fail(err);
-      const tidal = root.find(i => i.title === 'TIDAL');
-      if (!tidal) return fail('TIDAL not found');
-      nav({ item_key: tidal.item_key }, (err, _, tItems) => {
+      const lib = root.find(i => i.title === 'Library');
+      if (!lib) return fail('Library not found');
+      nav({ item_key: lib.item_key }, (err, _, tItems) => {
         if (err) return fail(err);
-        const search = tItems.find(i => (i.title || '').toLowerCase() === 'search');
-        if (!search) return fail('TIDAL search not found: ' + tItems.map(i => i.title).join(', '));
+        steps.push({ library_items: tItems.map(i => `${i.title} [${i.hint}]${i.input_prompt ? ' input:' + JSON.stringify(i.input_prompt) : ''}`) });
+        const search = tItems.find(i => i.input_prompt) || tItems.find(i => (i.title || '').toLowerCase() === 'search');
+        if (!search) return fail('Library search not found');
         nav({ item_key: search.item_key, input: [title, artist].filter(Boolean).join(' ') }, (err, _, cats) => {
           if (err) return fail(err);
+          steps.push({ search_categories: cats.map(i => `${i.title} [${i.hint}]`) });
           const tracksCat = cats.find(i => i.title === 'Tracks');
           if (!tracksCat) return fail('No Tracks category: ' + cats.map(i => i.title).join(', '));
           nav({ item_key: tracksCat.item_key }, (err, _, items) => {
