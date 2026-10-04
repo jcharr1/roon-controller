@@ -177,6 +177,46 @@ function pickStrictMatch(items, title, artist) {
       || eligible.find(i => normText(i.title) === base);
 }
 
+// ─── Profile selection ───────────────────────────────────────
+// Roon's queue shows "Added by <profile>". Extensions browse with their own
+// session, and Settings → Profile inside that session sets the profile for it.
+// Navigate Root → Settings → Profile → <name> in the given browse session.
+// cb(err, { selected, profiles })
+function selectProfile(name, msKey, cb) {
+  const want = String(name || '').trim().toLowerCase();
+  const nav = (opts, next) => {
+    const bOpts = { hierarchy: 'browse', ...opts };
+    const lOpts = { hierarchy: 'browse', count: 50, offset: 0 };
+    if (msKey) { bOpts.multi_session_key = msKey; lOpts.multi_session_key = msKey; }
+    _browse.browse(bOpts, (err) => {
+      if (err) return next(err);
+      _browse.load(lOpts, (err, lR) => next(err, (lR && lR.items) || []));
+    });
+  };
+  nav({ pop_all: true }, (err, root) => {
+    if (err) return cb(err);
+    const settings = root.find(i => i.title === 'Settings');
+    if (!settings) return cb('Settings menu not found');
+    nav({ item_key: settings.item_key }, (err, sItems) => {
+      if (err) return cb(err);
+      const pMenu = sItems.find(i => /profile/i.test(i.title));
+      if (!pMenu) return cb('Profile menu not found in Settings');
+      nav({ item_key: pMenu.item_key }, (err, pItems) => {
+        if (err) return cb(err);
+        const target = pItems.find(i => (i.title || '').toLowerCase() === want);
+        const profiles = pItems.map(i => ({ name: i.title, subtitle: i.subtitle, hint: i.hint }));
+        if (!target) return cb(`Profile "${name}" not found`, { profiles });
+        const bOpts = { hierarchy: 'browse', item_key: target.item_key };
+        if (msKey) bOpts.multi_session_key = msKey;
+        _browse.browse(bOpts, (err, r) => {
+          if (err) return cb(err);
+          cb(null, { selected: target.title, roon_action: r && r.action, message: r && r.message, profiles });
+        });
+      });
+    });
+  });
+}
+
 function trackQuery(t) {
   return t.query || [t.title, t.artist].filter(Boolean).join(' ');
 }
@@ -589,6 +629,19 @@ app.get('/api/profiles', (req, res) => {
   });
 });
 
+// POST /api/profiles/select { name, multi_session_key? }
+// Selects a profile in the extension's browse session (the default session when
+// multi_session_key is omitted). Affects only this extension, not Roon Remotes.
+app.post('/api/profiles/select', (req, res) => {
+  if (!requireCore(res)) return;
+  const { name, multi_session_key } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  selectProfile(name, multi_session_key, (err, r) => {
+    if (err) return res.status(404).json({ error: String(err), ...(r || {}) });
+    res.json({ success: true, ...r });
+  });
+});
+
 // ─── Transport ────────────────────────────────────────────────
 // POST /api/transport  { zone_id, action: play|pause|stop|next|previous|toggle_play_pause }
 app.post('/api/transport', (req, res) => {
@@ -797,7 +850,7 @@ app.post('/api/queue/clear', (req, res) => {
 // Tracks are processed sequentially with a 50 ms pause between them.
 app.post('/api/playlist', async (req, res) => {
   if (!requireCore(res)) return;
-  const { name, zone_id, tracks, mode = 'play_now' } = req.body;
+  const { name, zone_id, tracks, mode = 'play_now', profile } = req.body;
   if (!zone_id)                                 return res.status(400).json({ error: 'zone_id is required' });
   if (!Array.isArray(tracks) || !tracks.length) return res.status(400).json({ error: 'tracks[] is required' });
   if (!['play_now', 'queue'].includes(mode))    return res.status(400).json({ error: 'mode must be "play_now" or "queue"' });
@@ -844,6 +897,13 @@ app.post('/api/playlist', async (req, res) => {
 
     console.log(`[playlist] track[${i}] query="${query}" type=${type} roonAction="${roonAction}" artist="${artist||''}" msKey=${msKey}`);
 
+    if (profile) {
+      await new Promise(resolve => selectProfile(profile, msKey, (err) => {
+        if (err) console.log(`[playlist] track[${i}] profile "${profile}" not selected: ${err}`);
+        resolve();
+      }));
+    }
+
     await new Promise(resolve => {
       _browse.browse({ hierarchy: 'search', input: query, multi_session_key: msKey }, (err) => {
         if (err) { console.log(`[playlist] track[${i}] ERROR browse search: ${err}`); results.push({ query, status: 'error', reason: String(err) }); return resolve(); }
@@ -855,7 +915,7 @@ app.post('/api/playlist', async (req, res) => {
           const cat = (topR.items || []).find(it => it.title === type);
           if (!cat) {
             console.log(`[playlist] track[${i}] ERROR category "${type}" not found`);
-            results.push({ query, status: 'error', reason: `Category "${type}" not found` }); return resolve();
+            results.push({ query, title, artist, status: 'not_found', reason: `No ${type} results`, candidates: [] }); return resolve();
           }
 
           _browse.browse({ hierarchy: 'search', item_key: cat.item_key, multi_session_key: msKey }, (err) => {
