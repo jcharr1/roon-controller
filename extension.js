@@ -660,6 +660,63 @@ app.post('/api/profiles/select', (req, res) => {
   });
 });
 
+// EXPERIMENT: POST /api/experiment/profile-queue { zone_id, profile, title, artist }
+// Selects `profile` and queues a TIDAL track entirely within ONE browse-hierarchy
+// session (Settings > Profile, then TIDAL > Search > Tracks > Queue), to test
+// whether Roon's "Added by" follows the browse session's profile.
+app.post('/api/experiment/profile-queue', (req, res) => {
+  if (!requireCore(res)) return;
+  const { zone_id, profile, title, artist } = req.body || {};
+  if (!zone_id || !profile || !title) return res.status(400).json({ error: 'zone_id, profile and title are required' });
+  const msKey = `expq-${Date.now()}-${Math.random()}`;
+  const steps = [];
+  const nav = (opts, next) => {
+    _browse.browse({ hierarchy: 'browse', multi_session_key: msKey, ...opts }, (err, bR) => {
+      if (err) return next(err);
+      if (bR && bR.action !== 'list') return next(null, bR, []);
+      _browse.load({ hierarchy: 'browse', multi_session_key: msKey, count: 50, offset: 0 }, (err, lR) => next(err, bR, (lR && lR.items) || []));
+    });
+  };
+  const fail = (e) => res.status(500).json({ error: String(e), steps });
+
+  selectProfile(profile, msKey, (err, sel) => {
+    if (err) return fail(err);
+    steps.push({ profile_selected: sel.selected, settings_after: (sel.actions || []).map(a => `${a.title}: ${a.subtitle}`) });
+    nav({ pop_all: true }, (err, _, root) => {
+      if (err) return fail(err);
+      const tidal = root.find(i => i.title === 'TIDAL');
+      if (!tidal) return fail('TIDAL not found');
+      nav({ item_key: tidal.item_key }, (err, _, tItems) => {
+        if (err) return fail(err);
+        const search = tItems.find(i => (i.title || '').toLowerCase() === 'search');
+        if (!search) return fail('TIDAL search not found: ' + tItems.map(i => i.title).join(', '));
+        nav({ item_key: search.item_key, input: [title, artist].filter(Boolean).join(' ') }, (err, _, cats) => {
+          if (err) return fail(err);
+          const tracksCat = cats.find(i => i.title === 'Tracks');
+          if (!tracksCat) return fail('No Tracks category: ' + cats.map(i => i.title).join(', '));
+          nav({ item_key: tracksCat.item_key }, (err, _, items) => {
+            if (err) return fail(err);
+            const target = pickStrictMatch(items, title, artist);
+            steps.push({ candidates: items.slice(0, 3).map(i => `${i.title} — ${i.subtitle}`), picked: target && `${target.title} — ${target.subtitle}` });
+            if (!target) return res.json({ queued: false, reason: 'no strict match', steps });
+            const runAction = (list, depth) => {
+              const q = list.find(i => i.title === 'Queue');
+              if (q) return _browse.browse({ hierarchy: 'browse', multi_session_key: msKey, item_key: q.item_key, zone_or_output_id: zone_id }, (err, r) => {
+                if (err) return fail(err);
+                res.json({ queued: true, roon_action: r && r.action, steps });
+              });
+              const mid = list.find(i => i.hint === 'action_list');
+              if (!mid || depth > 2) return fail('Queue action not found: ' + list.map(i => i.title).join(', '));
+              nav({ item_key: mid.item_key, zone_or_output_id: zone_id }, (err, _, next) => err ? fail(err) : runAction(next, depth + 1));
+            };
+            nav({ item_key: target.item_key, zone_or_output_id: zone_id }, (err, _, aItems) => err ? fail(err) : runAction(aItems, 0));
+          });
+        });
+      });
+    });
+  });
+});
+
 // ─── Transport ────────────────────────────────────────────────
 // POST /api/transport  { zone_id, action: play|pause|stop|next|previous|toggle_play_pause }
 app.post('/api/transport', (req, res) => {
