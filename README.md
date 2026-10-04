@@ -77,7 +77,7 @@ curl http://YOUR_NAS_IP:3001/api/status | python3 -m json.tool
 | GET | `/api/browse[?item_key=<key>]` | Browse library hierarchy |
 | POST | `/api/find-and-play` | Search + play a single track `{ zone_id, query, action?, artist? }` |
 | POST | `/api/play-album` | Play an entire album natively `{ zone_id, query, action? }` |
-| POST | `/api/playlist` | Queue multiple tracks in order `{ name, zone_id, tracks[] }` |
+| POST | `/api/playlist` | Queue multiple tracks in order `{ name, zone_id, mode?, tracks[] }` (see strict matching below) |
 | POST | `/api/play` | Play an item by key `{ zone_id, item_key, action? }` |
 | POST | `/api/transport` | Playback control `{ zone_id, action }` |
 | POST | `/api/volume` | Set volume `{ zone_id, how, value }` |
@@ -106,6 +106,27 @@ curl http://YOUR_NAS_IP:3001/api/status | python3 -m json.tool
 ### Album vs track playback
 
 Use `/api/play-album` for albums — it navigates Roon's full browse hierarchy and queues all tracks natively in the correct order. The `/api/find-and-play` endpoint is for single tracks only. The `/api/playlist` endpoint queues tracks by individual search queries, useful for custom playlists but not for playing a specific album (tracks may match wrong versions).
+
+### Strict track matching for `/api/playlist` (this fork)
+
+Give tracks as `{ "title": "...", "artist": "..." }` and `/api/playlist` only plays an exact match:
+
+- the title must match (an exact full-title match is preferred; otherwise bracketed suffixes such as `(Remastered 2021)` are ignored),
+- the artist must be one of the track's credited names (so "Johnny Cash" does not match "The Ghost of Johnny Cash"),
+- karaoke, covers, tributes, live, acoustic, remix and similar versions are skipped unless the requested title asks for them.
+
+A track with no qualifying result is reported as `"status": "not_found"` with its top candidates, and is **not** replaced by another result. Tracks given only as `{ "query": ... }` keep the original loose behaviour.
+
+`mode` controls the queue:
+
+- `"play_now"` (default): the first track that matches replaces the queue and starts playing; the rest are queued after it.
+- `"queue"`: every track is appended; nothing currently playing is interrupted.
+
+```
+{ "zone_id": "...", "mode": "queue",
+  "tracks": [ { "title": "Fade Into You", "artist": "Mazzy Star" },
+              { "title": "Hurt", "artist": "Johnny Cash" } ] }
+```
 
 ### Avoiding cover versions
 
