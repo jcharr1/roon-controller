@@ -2,9 +2,8 @@ version: "3.8"
 
 services:
   roon-controller:
-    image: roon-controller:latest
-    # Build locally on QNAP, or push to a registry first
-    build: .
+    # Published by .github/workflows/docker-image.yml on every push to main
+    image: ghcr.io/jcharr1/roon-controller:main
     container_name: roon-controller
     restart: unless-stopped
 
@@ -14,16 +13,14 @@ services:
     network_mode: host
 
     environment:
-      - TZ=Europe/London
+      - TZ=America/Chicago
       - PORT=3001
 
     # Persist the Roon authorisation token so you don't re-authorise
     # every time the container restarts
     volumes:
-      - roon_auth:/app/.roon
-      # Mount extension.js from host so you can update it with just "docker restart"
-      # (no rebuild needed after changes)
-      - ./extension.js:/app/extension.js:ro
+      # Pairing token (config.json) lives here; see Dockerfile
+      - roon_auth:/app/data
 
 volumes:
   roon_auth:

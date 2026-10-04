@@ -21,4 +21,10 @@ EXPOSE 3001
 
 ENV NODE_ENV=production
 
-CMD ["node", "extension.js"]
+# node-roon-api saves its pairing token to ./config.json in the working directory.
+# Run from /app/data so the token lands in a volume and survives image updates.
+RUN mkdir -p /app/data
+VOLUME /app/data
+WORKDIR /app/data
+
+CMD ["node", "/app/extension.js"]
