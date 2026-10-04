@@ -210,7 +210,25 @@ function selectProfile(name, msKey, cb) {
         if (msKey) bOpts.multi_session_key = msKey;
         _browse.browse(bOpts, (err, r) => {
           if (err) return cb(err);
-          cb(null, { selected: target.title, roon_action: r && r.action, message: r && r.message, profiles });
+          if (!r || r.action !== 'list') {
+            return cb(null, { selected: target.title, roon_action: r && r.action, message: r && r.message, profiles });
+          }
+          // Opening a profile shows a submenu of actions; run the one that selects it.
+          const lOpts = { hierarchy: 'browse', count: 20, offset: 0 };
+          if (msKey) lOpts.multi_session_key = msKey;
+          _browse.load(lOpts, (err, aR) => {
+            if (err) return cb(err);
+            const actions = ((aR && aR.items) || []).map(i => ({ title: i.title, subtitle: i.subtitle, hint: i.hint }));
+            const act = ((aR && aR.items) || []).find(i => /select|switch|use|choose|set/i.test(i.title || ''))
+                     || ((aR && aR.items) || []).find(i => i.hint === 'action');
+            if (!act) return cb(`No select action for profile "${name}"`, { profiles, actions });
+            const aOpts = { hierarchy: 'browse', item_key: act.item_key };
+            if (msKey) aOpts.multi_session_key = msKey;
+            _browse.browse(aOpts, (err, r2) => {
+              if (err) return cb(err);
+              cb(null, { selected: target.title, action: act.title, roon_action: r2 && r2.action, message: r2 && r2.message, actions, profiles });
+            });
+          });
         });
       });
     });
