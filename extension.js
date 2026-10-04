@@ -104,8 +104,85 @@ function pickBestMatch(items, index, artist) {
   return items[Math.min(index, items.length - 1)];
 }
 
-function playlistRequestHash(zone_id, tracks) {
-  return zone_id + '|' + tracks.map(t => `${t.query}::${t.type || 'Tracks'}`).join('||');
+// ─── Strict matching (used when a track specifies `title`) ──────────────
+// Normalise for comparison: lowercase, strip accents, "&" → "and",
+// drop bracketed suffixes "(Remastered 2011)" / "[Live]" and " - Remaster" tails,
+// then keep only letters/digits.
+function normText(s) {
+  return String(s || '')
+    .normalize('NFKD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[\(\[][^\)\]]*[\)\]]/g, ' ')
+    .replace(/\s+-\s+.*$/, ' ')
+    .replace(/^the\s+/, '')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+// Versions we never want unless the requested title itself asks for them.
+// Remasters, radio edits and "(Electric Version)"-style labels are allowed.
+const UNWANTED_TITLE  = /\b(karaoke|cover|tribute|in the style of|originally performed|made famous|made popular|instrumental|remix|rmx|mix|a cappella|live|acoustic|unplugged|demo|rehearsals?|lullaby|8-bit|piano version|orchestral)\b/i;
+// Cover/karaoke factories show up in the artist line ("Karaoke Channel").
+const UNWANTED_ARTIST = /\b(karaoke|tribute|cover|in the style of|made famous|originally performed|lullaby|8-bit)\b/i;
+
+// Normalise one credited name: lowercase, strip accents, unify quotes and "&",
+// drop a leading "the", collapse whitespace.
+function normName(s) {
+  return String(s || '')
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[\u2018\u2019`]/g, "'")
+    .replace(/&/g, ' and ')
+    .replace(/\s+/g, ' ').trim()
+    .replace(/^the /, '');
+}
+
+// Roon's track subtitle is a comma-separated list of performers and writers.
+// The artist must appear as a whole credited name (or a run of consecutive
+// names, for artists like "Crosby, Stills, Nash & Young"), so "Johnny Cash"
+// does not match "The Ghost of Johnny Cash".
+function creditsInclude(subtitle, artist) {
+  const credits = String(subtitle || '').split(/\s*,\s*/).map(normName);
+  const want    = String(artist || '').split(/\s*,\s*/).map(normName).join('|');
+  return ('|' + credits.join('|') + '|').includes('|' + want + '|');
+}
+
+// Full-title comparison key: like normText but keeps bracketed parts and
+// " - ..." tails, so "Hurt (Quiet)" != "Hurt" and "(Live)" requests stay exact.
+function normFull(s) {
+  return String(s || '')
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/^the\s+/, '')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+// Pick a candidate whose credits include the requested artist and which isn't an
+// unwanted version, keeping Roon's ranking within each pass:
+//   pass 1: full title matches exactly (prefers the plain original, and honours
+//           explicit "(Live)"-style requests);
+//   pass 2: title matches once bracketed suffixes / " - Remaster" tails are
+//           ignored (accepts "(Remastered 2021)", "(Electric Version)").
+// Returns undefined when nothing qualifies; callers must NOT fall back.
+function pickStrictMatch(items, title, artist) {
+  const allowTitle  = UNWANTED_TITLE.test(title || '');
+  const allowArtist = UNWANTED_ARTIST.test(artist || '');
+  const eligible = (items || []).filter(i =>
+    (!artist || creditsInclude(i.subtitle, artist)) &&
+    (allowTitle  || !UNWANTED_TITLE.test(i.title || '')) &&
+    (allowArtist || !UNWANTED_ARTIST.test(i.subtitle || '')));
+  const full = normFull(title), base = normText(title);
+  return eligible.find(i => normFull(i.title) === full)
+      || eligible.find(i => normText(i.title) === base);
+}
+
+function trackQuery(t) {
+  return t.query || [t.title, t.artist].filter(Boolean).join(' ');
+}
+
+function playlistRequestHash(zone_id, tracks, mode) {
+  return zone_id + '|' + (mode || 'play_now') + '|' + tracks.map(t => `${trackQuery(t)}::${t.type || 'Tracks'}`).join('||');
 }
 
 // ─── REST API ─────────────────────────────────────────────────
@@ -700,7 +777,16 @@ app.post('/api/queue/clear', (req, res) => {
 
 // ─── Playlist (Queue Builder) ──────────────────────────────────
 // POST /api/playlist
-// { name: "My Playlist", zone_id: "...", tracks: [{query, type?}] }
+// { name: "My Playlist", zone_id: "...", mode?: "play_now"|"queue",
+//   tracks: [{query, type?, artist?} | {title, artist, query?}] }
+//
+// Tracks given as {title, artist} use strict matching (see pickStrictMatch):
+// a track with no exact original-version match is reported as "not_found"
+// and skipped, never substituted.
+//
+// mode "play_now" (default): the first track that matches uses "Play Now"
+// (replaces the queue); the rest use "Queue". mode "queue": every track is
+// appended with "Queue" and nothing currently playing is interrupted.
 //
 // NOTE: Roon's Extension API does not expose playlist management actions
 // (Add to Playlist, Create Playlist) — only playback actions are available
@@ -708,14 +794,13 @@ app.post('/api/queue/clear', (req, res) => {
 // a Roon queue, which you can then save as a named playlist from within the
 // Roon app: Queue → ⋮ → Save Queue as Playlist.
 //
-// The first track uses "Play Now" (starts playback, clears existing queue).
-// All subsequent tracks use "Queue" (appended in order).
-// Tracks are processed sequentially with a 2-second delay between calls.
+// Tracks are processed sequentially with a 50 ms pause between them.
 app.post('/api/playlist', async (req, res) => {
   if (!requireCore(res)) return;
-  const { name, zone_id, tracks } = req.body;
+  const { name, zone_id, tracks, mode = 'play_now' } = req.body;
   if (!zone_id)                                 return res.status(400).json({ error: 'zone_id is required' });
   if (!Array.isArray(tracks) || !tracks.length) return res.status(400).json({ error: 'tracks[] is required' });
+  if (!['play_now', 'queue'].includes(mode))    return res.status(400).json({ error: 'mode must be "play_now" or "queue"' });
 
   // Lazy TTL cleanup
   const now = Date.now();
@@ -730,7 +815,7 @@ app.post('/api/playlist', async (req, res) => {
   }
 
   // Layer 2: duplicate payload check
-  const reqHash = playlistRequestHash(zone_id, tracks);
+  const reqHash = playlistRequestHash(zone_id, tracks, mode);
   if (_playlistRecentHashes.has(reqHash)) {
     const age = Math.round((now - _playlistRecentHashes.get(reqHash)) / 1000);
     console.log(`[playlist] REJECTED (duplicate) zone_id=${zone_id} age=${age}s`);
@@ -741,16 +826,19 @@ app.post('/api/playlist', async (req, res) => {
   _playlistInFlight.set(zone_id, true);
 
   const results      = [];
+  let   playedNow    = false;   // has a "Play Now" been executed yet?
   const ACTION_MAP   = { 'Add to Queue': 'Queue', 'Play Next': 'Add Next', 'Add to queue': 'Queue' };
 
   console.log(`[playlist] START name="${name}" zone_id=${zone_id} tracks=${tracks.length}`);
 
   try {
   for (let i = 0; i < tracks.length; i++) {
-    const { query, type = 'Tracks', artist } = tracks[i];
+    const { type = 'Tracks', artist, title } = tracks[i];
+    const query  = trackQuery(tracks[i]);
+    const strict = !!title;
     if (!query) { results.push({ query, status: 'skipped', reason: 'missing query' }); continue; }
 
-    const action    = i === 0 ? 'Play Now' : 'Queue';
+    const action    = (mode === 'play_now' && !playedNow) ? 'Play Now' : 'Queue';
     const roonAction = ACTION_MAP[action] || action;
     const msKey     = `pl-${Date.now()}-${Math.random()}`;
 
@@ -778,9 +866,13 @@ app.post('/api/playlist', async (req, res) => {
 
               const catItems = catR.items || [];
               console.log(`[playlist] track[${i}] candidates (${catItems.length}): ${catItems.slice(0,5).map(c=>`"${c.title}"/"${c.subtitle}"`).join(' | ')}`);
-              const target = pickBestMatch(catItems, 0, artist);
-              console.log(`[playlist] track[${i}] selected: "${target?.title}" / "${target?.subtitle}"`);
-              if (!target) { results.push({ query, status: 'not_found' }); return resolve(); }
+              const target = strict ? pickStrictMatch(catItems, title, artist) : pickBestMatch(catItems, 0, artist);
+              console.log(`[playlist] track[${i}] selected (${strict ? 'strict' : 'loose'}): "${target?.title}" / "${target?.subtitle}"`);
+              if (!target) {
+                results.push({ query, title, artist, status: 'not_found',
+                  candidates: catItems.slice(0, 3).map(c => `${c.title} — ${c.subtitle}`) });
+                return resolve();
+              }
 
               const trackLabel = `${target.title} — ${target.subtitle}`;
 
@@ -805,6 +897,7 @@ app.post('/api/playlist', async (req, res) => {
                     _browse.browse({ hierarchy: 'search', item_key: actionItem.item_key, zone_or_output_id: zone_id, multi_session_key: msKey }, (err, playR) => {
                       if (err) { console.log(`[playlist] track[${i}] ERROR execAction: ${err}`); results.push({ query, track: trackLabel, status: 'error', reason: String(err) }); return resolve(); }
                       console.log(`[playlist] track[${i}] execAction result: roon_action="${playR.action}"`);
+                      if (roonAction === 'Play Now') playedNow = true;
                       results.push({ query, track: trackLabel, status: 'queued', action: roonAction, roon_action: playR.action });
                       resolve();
                     });
@@ -848,6 +941,8 @@ app.post('/api/playlist', async (req, res) => {
   _playlistRecentHashes.set(reqHash, Date.now());
   res.json({
     name,
+    mode,
+    not_found: results.filter(r => r.status === 'not_found').length,
     note: 'Tracks queued successfully. To save as a Roon playlist: Queue → ⋮ → Save Queue as Playlist.',
     queued,
     total: tracks.length,
