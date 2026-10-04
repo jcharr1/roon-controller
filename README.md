@@ -117,6 +117,8 @@ Give tracks as `{ "title": "...", "artist": "..." }` and `/api/playlist` only pl
 
 A track with no qualifying result is reported as `"status": "not_found"` with its top candidates, and is **not** replaced by another result. Tracks given only as `{ "query": ... }` keep the original loose behaviour.
 
+`profile` (optional, e.g. `"Claude"`) makes the queue show **"Added by <profile>"**. Create the profile in Roon first (Settings → Profile). Roon attributes queue actions to the profile selected in the extension's *browse* session, so `/api/playlist` selects the profile and then searches (Library → Search, which includes streaming services) and queues inside that one session. The response's `profile` field reports whether the selection was verified. Plays started this way also count toward that profile's listening history.
+
 `mode` controls the queue:
 
 - `"play_now"` (default): the first track that matches replaces the queue and starts playing; the rest are queued after it.

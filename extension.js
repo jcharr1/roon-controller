@@ -177,62 +177,77 @@ function pickStrictMatch(items, title, artist) {
       || eligible.find(i => normText(i.title) === base);
 }
 
-// ─── Profile selection ───────────────────────────────────────
-// Roon's queue shows "Added by <profile>". Extensions browse with their own
-// session, and Settings → Profile inside that session sets the profile for it.
-// Navigate Root → Settings → Profile → <name> in the given browse session.
-// cb(err, { selected, profiles })
-function selectProfile(name, msKey, cb) {
+// ─── Browse-session helpers ──────────────────────────────────
+// Roon's queue shows "Added by <profile>", and that profile is the one selected
+// in the browse-hierarchy session that runs the action. So /api/playlist does
+// everything (profile selection, search, queue action) inside ONE browse
+// session. The separate "search" hierarchy keeps its own profile and cannot be
+// used for this.
+function browseP(opts) {
+  return new Promise((resolve, reject) => _browse.browse(opts, (err, r) => err ? reject(err) : resolve(r)));
+}
+function loadP(opts) {
+  return new Promise((resolve, reject) => _browse.load(opts, (err, r) => err ? reject(err) : resolve(r)));
+}
+// Browse to a node in the session's browse hierarchy and load its items.
+async function navB(msKey, opts, count = 100) {
+  const r = await browseP({ hierarchy: 'browse', multi_session_key: msKey, ...opts });
+  if (!r || r.action !== 'list') return { r, items: [] };
+  const l = await loadP({ hierarchy: 'browse', multi_session_key: msKey, count, offset: 0 });
+  return { r, items: (l && l.items) || [] };
+}
+
+// Select a Roon profile in the session: Root > Settings > Profile > <name>.
+// Opening the profile entry selects it and returns to the Settings list.
+async function selectProfile(msKey, name) {
   const want = String(name || '').trim().toLowerCase();
-  const nav = (opts, next) => {
-    const bOpts = { hierarchy: 'browse', ...opts };
-    const lOpts = { hierarchy: 'browse', count: 50, offset: 0 };
-    if (msKey) { bOpts.multi_session_key = msKey; lOpts.multi_session_key = msKey; }
-    _browse.browse(bOpts, (err) => {
-      if (err) return next(err);
-      _browse.load(lOpts, (err, lR) => next(err, (lR && lR.items) || []));
-    });
-  };
-  nav({ pop_all: true }, (err, root) => {
-    if (err) return cb(err);
-    const settings = root.find(i => i.title === 'Settings');
-    if (!settings) return cb('Settings menu not found');
-    nav({ item_key: settings.item_key }, (err, sItems) => {
-      if (err) return cb(err);
-      const pMenu = sItems.find(i => /profile/i.test(i.title));
-      if (!pMenu) return cb('Profile menu not found in Settings');
-      nav({ item_key: pMenu.item_key }, (err, pItems) => {
-        if (err) return cb(err);
-        const target = pItems.find(i => (i.title || '').toLowerCase() === want);
-        const profiles = pItems.map(i => ({ name: i.title, subtitle: i.subtitle, hint: i.hint }));
-        if (!target) return cb(`Profile "${name}" not found`, { profiles });
-        const bOpts = { hierarchy: 'browse', item_key: target.item_key };
-        if (msKey) bOpts.multi_session_key = msKey;
-        _browse.browse(bOpts, (err, r) => {
-          if (err) return cb(err);
-          if (!r || r.action !== 'list') {
-            return cb(null, { selected: target.title, roon_action: r && r.action, message: r && r.message, profiles });
-          }
-          // Opening a profile shows a submenu of actions; run the one that selects it.
-          const lOpts = { hierarchy: 'browse', count: 20, offset: 0 };
-          if (msKey) lOpts.multi_session_key = msKey;
-          _browse.load(lOpts, (err, aR) => {
-            if (err) return cb(err);
-            const actions = ((aR && aR.items) || []).map(i => ({ title: i.title, subtitle: i.subtitle, hint: i.hint }));
-            const act = ((aR && aR.items) || []).find(i => /select|switch|use|choose|set/i.test(i.title || ''))
-                     || ((aR && aR.items) || []).find(i => i.hint === 'action');
-            if (!act) return cb(`No select action for profile "${name}"`, { profiles, actions });
-            const aOpts = { hierarchy: 'browse', item_key: act.item_key };
-            if (msKey) aOpts.multi_session_key = msKey;
-            _browse.browse(aOpts, (err, r2) => {
-              if (err) return cb(err);
-              cb(null, { selected: target.title, action: act.title, roon_action: r2 && r2.action, message: r2 && r2.message, actions, profiles });
-            });
-          });
-        });
-      });
-    });
-  });
+  const root = await navB(msKey, { pop_all: true });
+  const settings = root.items.find(i => i.title === 'Settings');
+  if (!settings) throw new Error('Settings menu not found');
+  const sItems = (await navB(msKey, { item_key: settings.item_key })).items;
+  const pMenu = sItems.find(i => /profile/i.test(i.title || ''));
+  if (!pMenu) throw new Error('Profile menu not found in Settings');
+  const pItems = (await navB(msKey, { item_key: pMenu.item_key })).items;
+  const profiles = pItems.map(i => i.title);
+  const target = pItems.find(i => (i.title || '').toLowerCase() === want);
+  if (!target) { const e = new Error(`Profile "${name}" not found`); e.profiles = profiles; throw e; }
+  const after = (await navB(msKey, { item_key: target.item_key })).items;
+  const row = after.find(i => /profile/i.test(i.title || ''));
+  return { selected: target.title, verified: !!row && row.subtitle === target.title, profiles };
+}
+
+// Library > Search (covers the library and streaming services) > Tracks.
+async function searchTracksB(msKey, query) {
+  const root = await navB(msKey, { pop_all: true });
+  const lib = root.items.find(i => i.title === 'Library');
+  if (!lib) throw new Error('Library not found');
+  const libItems = (await navB(msKey, { item_key: lib.item_key })).items;
+  const search = libItems.find(i => i.input_prompt) || libItems.find(i => /search/i.test(i.title || ''));
+  if (!search) throw new Error('Library search not found');
+  const cats = (await navB(msKey, { item_key: search.item_key, input: query })).items;
+  const tracksCat = cats.find(i => i.title === 'Tracks');
+  if (!tracksCat) return [];
+  return (await navB(msKey, { item_key: tracksCat.item_key }, 50)).items;
+}
+
+// Run a play action ("Play Now", "Queue", ...) on a track item for a zone,
+// descending through an intermediate action_list level if Roon shows one.
+async function runTrackAction(msKey, item, zone_id, roonAction) {
+  let level = await navB(msKey, { item_key: item.item_key, zone_or_output_id: zone_id }, 20);
+  if (level.r && level.r.action !== 'list') return { roon_action: level.r.action, auto: true };
+  for (let depth = 0; depth < 3; depth++) {
+    const act = level.items.find(i => i.title === roonAction);
+    if (act) {
+      const r = await browseP({ hierarchy: 'browse', multi_session_key: msKey, item_key: act.item_key, zone_or_output_id: zone_id });
+      return { roon_action: r && r.action };
+    }
+    const mid = level.items.find(i => i.hint === 'action_list');
+    if (!mid) break;
+    level = await navB(msKey, { item_key: mid.item_key, zone_or_output_id: zone_id }, 20);
+  }
+  const e = new Error(`Action "${roonAction}" not found`);
+  e.available = level.items.map(i => i.title);
+  throw e;
 }
 
 function trackQuery(t) {
@@ -647,76 +662,18 @@ app.get('/api/profiles', (req, res) => {
   });
 });
 
-// POST /api/profiles/select { name, multi_session_key? }
-// Selects a profile in the extension's browse session (the default session when
-// multi_session_key is omitted). Affects only this extension, not Roon Remotes.
-app.post('/api/profiles/select', (req, res) => {
+// POST /api/profiles/select { name }
+// Selects a profile in a throwaway browse session and reports whether it took.
+// Useful for checking a profile name; /api/playlist selects per request.
+app.post('/api/profiles/select', async (req, res) => {
   if (!requireCore(res)) return;
-  const { name, multi_session_key } = req.body || {};
+  const { name } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name is required' });
-  selectProfile(name, multi_session_key, (err, r) => {
-    if (err) return res.status(404).json({ error: String(err), ...(r || {}) });
-    res.json({ success: true, ...r });
-  });
-});
-
-// EXPERIMENT: POST /api/experiment/profile-queue { zone_id, profile, title, artist }
-// Selects `profile` and queues a TIDAL track entirely within ONE browse-hierarchy
-// session (Settings > Profile, then Library > Search > Tracks > Queue), to test
-// whether Roon's "Added by" follows the browse session's profile.
-app.post('/api/experiment/profile-queue', (req, res) => {
-  if (!requireCore(res)) return;
-  const { zone_id, profile, title, artist } = req.body || {};
-  if (!zone_id || !profile || !title) return res.status(400).json({ error: 'zone_id, profile and title are required' });
-  const msKey = `expq-${Date.now()}-${Math.random()}`;
-  const steps = [];
-  const nav = (opts, next) => {
-    _browse.browse({ hierarchy: 'browse', multi_session_key: msKey, ...opts }, (err, bR) => {
-      if (err) return next(err);
-      if (bR && bR.action !== 'list') return next(null, bR, []);
-      _browse.load({ hierarchy: 'browse', multi_session_key: msKey, count: 50, offset: 0 }, (err, lR) => next(err, bR, (lR && lR.items) || []));
-    });
-  };
-  const fail = (e) => res.status(500).json({ error: String(e), steps });
-
-  selectProfile(profile, msKey, (err, sel) => {
-    if (err) return fail(err);
-    steps.push({ profile_selected: sel.selected, settings_after: (sel.actions || []).map(a => `${a.title}: ${a.subtitle}`) });
-    nav({ pop_all: true }, (err, _, root) => {
-      if (err) return fail(err);
-      const lib = root.find(i => i.title === 'Library');
-      if (!lib) return fail('Library not found');
-      nav({ item_key: lib.item_key }, (err, _, tItems) => {
-        if (err) return fail(err);
-        steps.push({ library_items: tItems.map(i => `${i.title} [${i.hint}]${i.input_prompt ? ' input:' + JSON.stringify(i.input_prompt) : ''}`) });
-        const search = tItems.find(i => i.input_prompt) || tItems.find(i => (i.title || '').toLowerCase() === 'search');
-        if (!search) return fail('Library search not found');
-        nav({ item_key: search.item_key, input: [title, artist].filter(Boolean).join(' ') }, (err, _, cats) => {
-          if (err) return fail(err);
-          steps.push({ search_categories: cats.map(i => `${i.title} [${i.hint}]`) });
-          const tracksCat = cats.find(i => i.title === 'Tracks');
-          if (!tracksCat) return fail('No Tracks category: ' + cats.map(i => i.title).join(', '));
-          nav({ item_key: tracksCat.item_key }, (err, _, items) => {
-            if (err) return fail(err);
-            const target = pickStrictMatch(items, title, artist);
-            steps.push({ candidates: items.slice(0, 3).map(i => `${i.title} — ${i.subtitle}`), picked: target && `${target.title} — ${target.subtitle}` });
-            if (!target) return res.json({ queued: false, reason: 'no strict match', steps });
-            const runAction = (list, depth) => {
-              const q = list.find(i => i.title === 'Queue');
-              if (q) return _browse.browse({ hierarchy: 'browse', multi_session_key: msKey, item_key: q.item_key, zone_or_output_id: zone_id }, (err, r) => {
-                if (err) return fail(err);
-                res.json({ queued: true, roon_action: r && r.action, steps });
-              });
-              const mid = list.find(i => i.hint === 'action_list');
-              if (!mid || depth > 2) return fail('Queue action not found: ' + list.map(i => i.title).join(', '));
-              nav({ item_key: mid.item_key, zone_or_output_id: zone_id }, (err, _, next) => err ? fail(err) : runAction(next, depth + 1));
-            };
-            nav({ item_key: target.item_key, zone_or_output_id: zone_id }, (err, _, aItems) => err ? fail(err) : runAction(aItems, 0));
-          });
-        });
-      });
-    });
-  });
+  try {
+    res.json({ success: true, ...(await selectProfile(`prof-${Date.now()}-${Math.random()}`, name)) });
+  } catch (err) {
+    res.status(404).json({ error: String(err.message || err), profiles: err.profiles });
+  }
 });
 
 // ─── Transport ────────────────────────────────────────────────
@@ -907,27 +864,26 @@ app.post('/api/queue/clear', (req, res) => {
 
 // ─── Playlist (Queue Builder) ──────────────────────────────────
 // POST /api/playlist
-// { name: "My Playlist", zone_id: "...", mode?: "play_now"|"queue",
-//   tracks: [{query, type?, artist?} | {title, artist, query?}] }
+// { name: "My Playlist", zone_id: "...", mode?: "play_now"|"queue", profile?: "Claude",
+//   tracks: [{title, artist} | {query, type?, artist?}] }
+//
+// Everything runs in ONE browse-hierarchy session: optional profile selection
+// (so Roon's queue shows "Added by <profile>"), then for each track
+// Library > Search > Tracks > match > action.
 //
 // Tracks given as {title, artist} use strict matching (see pickStrictMatch):
-// a track with no exact original-version match is reported as "not_found"
-// and skipped, never substituted.
+// no exact original-version match means "not_found", never a substitute.
+// {query}-only tracks keep the loose behaviour (pickBestMatch).
 //
 // mode "play_now" (default): the first track that matches uses "Play Now"
 // (replaces the queue); the rest use "Queue". mode "queue": every track is
 // appended with "Queue" and nothing currently playing is interrupted.
 //
-// NOTE: Roon's Extension API does not expose playlist management actions
-// (Add to Playlist, Create Playlist) — only playback actions are available
-// to third-party extensions. This endpoint instead builds the playlist as
-// a Roon queue, which you can then save as a named playlist from within the
-// Roon app: Queue → ⋮ → Save Queue as Playlist.
-//
-// Tracks are processed sequentially with a 50 ms pause between them.
+// Roon's Extension API cannot create playlists; save the queue in the Roon
+// app if wanted: Queue → ⋮ → Save Queue as Playlist.
 app.post('/api/playlist', async (req, res) => {
   if (!requireCore(res)) return;
-  const { name, zone_id, tracks, mode = 'play_now', profile } = req.body;
+  const { name, zone_id, tracks, mode = 'play_now', profile } = req.body || {};
   if (!zone_id)                                 return res.status(400).json({ error: 'zone_id is required' });
   if (!Array.isArray(tracks) || !tracks.length) return res.status(400).json({ error: 'tracks[] is required' });
   if (!['play_now', 'queue'].includes(mode))    return res.status(400).json({ error: 'mode must be "play_now" or "queue"' });
@@ -952,143 +908,68 @@ app.post('/api/playlist', async (req, res) => {
     return res.status(409).json({ error: `This playlist was already queued ${age}s ago. Call /api/playlist exactly once and wait for the full response.`, reason: 'duplicate', zone_id, age_seconds: age });
   }
 
-  // Acquire lock
   _playlistInFlight.set(zone_id, true);
-
-  const results      = [];
-  let   playedNow    = false;   // has a "Play Now" been executed yet?
-  const ACTION_MAP   = { 'Add to Queue': 'Queue', 'Play Next': 'Add Next', 'Add to queue': 'Queue' };
-
-  console.log(`[playlist] START name="${name}" zone_id=${zone_id} tracks=${tracks.length}`);
+  const msKey   = `pl-${Date.now()}-${Math.random()}`;
+  const results = [];
+  let playedNow = false;
+  let profileInfo = null;
+  console.log(`[playlist] START name="${name}" zone_id=${zone_id} mode=${mode} profile=${profile || '-'} tracks=${tracks.length}`);
 
   try {
-  for (let i = 0; i < tracks.length; i++) {
-    const { type = 'Tracks', artist, title } = tracks[i];
-    const query  = trackQuery(tracks[i]);
-    const strict = !!title;
-    if (!query) { results.push({ query, status: 'skipped', reason: 'missing query' }); continue; }
-
-    const action    = (mode === 'play_now' && !playedNow) ? 'Play Now' : 'Queue';
-    const roonAction = ACTION_MAP[action] || action;
-    const msKey     = `pl-${Date.now()}-${Math.random()}`;
-
-    console.log(`[playlist] track[${i}] query="${query}" type=${type} roonAction="${roonAction}" artist="${artist||''}" msKey=${msKey}`);
-
     if (profile) {
-      await new Promise(resolve => selectProfile(profile, msKey, (err) => {
-        if (err) console.log(`[playlist] track[${i}] profile "${profile}" not selected: ${err}`);
-        resolve();
-      }));
+      try {
+        profileInfo = await selectProfile(msKey, profile);
+      } catch (err) {
+        profileInfo = { error: String(err.message || err), profiles: err.profiles };
+      }
+      console.log(`[playlist] profile: ${JSON.stringify(profileInfo)}`);
     }
 
-    await new Promise(resolve => {
-      _browse.browse({ hierarchy: 'search', input: query, multi_session_key: msKey }, (err) => {
-        if (err) { console.log(`[playlist] track[${i}] ERROR browse search: ${err}`); results.push({ query, status: 'error', reason: String(err) }); return resolve(); }
+    for (let i = 0; i < tracks.length; i++) {
+      const { type = 'Tracks', artist, title } = tracks[i] || {};
+      const query  = trackQuery(tracks[i] || {});
+      const strict = !!title;
+      if (!query) { results.push({ query, status: 'skipped', reason: 'missing query' }); continue; }
+      if (type !== 'Tracks') { results.push({ query, status: 'skipped', reason: 'only type "Tracks" is supported' }); continue; }
 
-        _browse.load({ hierarchy: 'search', multi_session_key: msKey, count: 100, offset: 0 }, (err, topR) => {
-          if (err) { console.log(`[playlist] track[${i}] ERROR load categories: ${err}`); results.push({ query, status: 'error', reason: String(err) }); return resolve(); }
+      const roonAction = (mode === 'play_now' && !playedNow) ? 'Play Now' : 'Queue';
+      try {
+        const items  = await searchTracksB(msKey, query);
+        const target = strict ? pickStrictMatch(items, title, artist) : pickBestMatch(items, 0, artist);
+        console.log(`[playlist] track[${i}] "${query}" ${strict ? 'strict' : 'loose'} -> ${target ? `"${target.title}" / "${target.subtitle}"` : 'none'}`);
+        if (!target) {
+          results.push({ query, title, artist, status: 'not_found',
+            candidates: items.slice(0, 3).map(c => `${c.title} — ${c.subtitle}`) });
+          continue;
+        }
+        const trackLabel = `${target.title} — ${target.subtitle}`;
+        const r = await runTrackAction(msKey, target, zone_id, roonAction);
+        if (r.auto) { results.push({ query, track: trackLabel, status: 'auto_action', action: r.roon_action }); continue; }
+        if (roonAction === 'Play Now') playedNow = true;
+        results.push({ query, track: trackLabel, status: 'queued', action: roonAction, roon_action: r.roon_action });
+      } catch (err) {
+        console.log(`[playlist] track[${i}] ERROR ${err.message || err}`);
+        results.push({ query, status: 'error', reason: String(err.message || err), available: err.available });
+      }
+    }
 
-          console.log(`[playlist] track[${i}] categories: ${(topR.items||[]).map(it=>it.title).join(', ')}`);
-          const cat = (topR.items || []).find(it => it.title === type);
-          if (!cat) {
-            console.log(`[playlist] track[${i}] ERROR category "${type}" not found`);
-            results.push({ query, title, artist, status: 'not_found', reason: `No ${type} results`, candidates: [] }); return resolve();
-          }
-
-          _browse.browse({ hierarchy: 'search', item_key: cat.item_key, multi_session_key: msKey }, (err) => {
-            if (err) { console.log(`[playlist] track[${i}] ERROR browse category: ${err}`); results.push({ query, status: 'error', reason: String(err) }); return resolve(); }
-
-            _browse.load({ hierarchy: 'search', multi_session_key: msKey, count: 50, offset: 0 }, (err, catR) => {
-              if (err) { console.log(`[playlist] track[${i}] ERROR load results: ${err}`); results.push({ query, status: 'error', reason: String(err) }); return resolve(); }
-
-              const catItems = catR.items || [];
-              console.log(`[playlist] track[${i}] candidates (${catItems.length}): ${catItems.slice(0,5).map(c=>`"${c.title}"/"${c.subtitle}"`).join(' | ')}`);
-              const target = strict ? pickStrictMatch(catItems, title, artist) : pickBestMatch(catItems, 0, artist);
-              console.log(`[playlist] track[${i}] selected (${strict ? 'strict' : 'loose'}): "${target?.title}" / "${target?.subtitle}"`);
-              if (!target) {
-                results.push({ query, title, artist, status: 'not_found',
-                  candidates: catItems.slice(0, 3).map(c => `${c.title} — ${c.subtitle}`) });
-                return resolve();
-              }
-
-              const trackLabel = `${target.title} — ${target.subtitle}`;
-
-              _browse.browse({ hierarchy: 'search', item_key: target.item_key, zone_or_output_id: zone_id, multi_session_key: msKey }, (err, r) => {
-                if (err) { console.log(`[playlist] track[${i}] ERROR browse track: ${err}`); results.push({ query, track: trackLabel, status: 'error', reason: String(err) }); return resolve(); }
-                console.log(`[playlist] track[${i}] browse-track returned action="${r.action}"`);
-                if (r.action !== 'list') {
-                  console.log(`[playlist] track[${i}] WARNING: action="${r.action}" — no play action executed (auto_action path)`);
-                  results.push({ query, track: trackLabel, status: 'auto_action', action: r.action }); return resolve();
-                }
-
-                _browse.load({ hierarchy: 'search', multi_session_key: msKey, count: 10, offset: 0 }, (err, actionR) => {
-                  if (err) { console.log(`[playlist] track[${i}] ERROR load action list: ${err}`); results.push({ query, track: trackLabel, status: 'error', reason: String(err) }); return resolve(); }
-
-                  console.log(`[playlist] track[${i}] action list: ${(actionR.items||[]).map(it=>`"${it.title}"(hint=${it.hint})`).join(', ')}`);
-                  const directAction = (actionR.items || []).find(it => it.title === roonAction);
-                  const isIntermediate = !directAction && (actionR.items||[]).length > 0 && actionR.items[0].hint === 'action_list';
-                  console.log(`[playlist] track[${i}] directAction=${!!directAction} isIntermediate=${isIntermediate} looking for "${roonAction}"`);
-
-                  const execAction = (actionItem) => {
-                    console.log(`[playlist] track[${i}] execAction "${actionItem.title}" item_key=${actionItem.item_key}`);
-                    _browse.browse({ hierarchy: 'search', item_key: actionItem.item_key, zone_or_output_id: zone_id, multi_session_key: msKey }, (err, playR) => {
-                      if (err) { console.log(`[playlist] track[${i}] ERROR execAction: ${err}`); results.push({ query, track: trackLabel, status: 'error', reason: String(err) }); return resolve(); }
-                      console.log(`[playlist] track[${i}] execAction result: roon_action="${playR.action}"`);
-                      if (roonAction === 'Play Now') playedNow = true;
-                      results.push({ query, track: trackLabel, status: 'queued', action: roonAction, roon_action: playR.action });
-                      resolve();
-                    });
-                  };
-
-                  if (directAction) return execAction(directAction);
-
-                  if (isIntermediate) {
-                    const mid = actionR.items[0];
-                    console.log(`[playlist] track[${i}] intermediate: browsing into "${mid.title}" item_key=${mid.item_key}`);
-                    _browse.browse({ hierarchy: 'search', item_key: mid.item_key, zone_or_output_id: zone_id, multi_session_key: msKey }, (err) => {
-                      if (err) { console.log(`[playlist] track[${i}] ERROR intermediate browse: ${err}`); results.push({ query, track: trackLabel, status: 'error', reason: String(err) }); return resolve(); }
-                      _browse.load({ hierarchy: 'search', multi_session_key: msKey, count: 15, offset: 0 }, (err, actionR2) => {
-                        if (err) { console.log(`[playlist] track[${i}] ERROR intermediate load: ${err}`); results.push({ query, track: trackLabel, status: 'error', reason: String(err) }); return resolve(); }
-                        console.log(`[playlist] track[${i}] intermediate action list: ${(actionR2.items||[]).map(it=>it.title).join(', ')}`);
-                        const pa2 = (actionR2.items || []).find(it => it.title === roonAction);
-                        if (!pa2) { results.push({ query, track: trackLabel, status: 'error', reason: `Action "${roonAction}" not found`, available: actionR2.items.map(it=>it.title) }); return resolve(); }
-                        execAction(pa2);
-                      });
-                    });
-                    return;
-                  }
-
-                  console.log(`[playlist] track[${i}] ERROR action "${roonAction}" not found in list`);
-                  results.push({ query, track: trackLabel, status: 'error', reason: `Action "${roonAction}" not found`, available: (actionR.items||[]).map(it=>it.title) });
-                  resolve();
-                });
-              });
-            });
-          });
-        });
-      });
+    const queued = results.filter(r => r.status === 'queued').length;
+    console.log(`[playlist] DONE queued=${queued}/${tracks.length}`);
+    _playlistRecentHashes.set(reqHash, Date.now());
+    res.json({
+      name,
+      mode,
+      profile: profileInfo,
+      queued,
+      not_found: results.filter(r => r.status === 'not_found').length,
+      total: tracks.length,
+      results
     });
-
-    if (i < tracks.length - 1) await new Promise(r => setTimeout(r, 50));
-  }
-
-  const queued = results.filter(r => r.status === 'queued').length;
-  console.log(`[playlist] DONE queued=${queued}/${tracks.length} results=${JSON.stringify(results)}`);
-  _playlistInFlight.delete(zone_id);
-  _playlistRecentHashes.set(reqHash, Date.now());
-  res.json({
-    name,
-    mode,
-    not_found: results.filter(r => r.status === 'not_found').length,
-    note: 'Tracks queued successfully. To save as a Roon playlist: Queue → ⋮ → Save Queue as Playlist.',
-    queued,
-    total: tracks.length,
-    results
-  });
   } catch (err) {
-    _playlistInFlight.delete(zone_id);
     console.log(`[playlist] EXCEPTION zone_id=${zone_id}: ${err}`);
-    res.status(500).json({ error: String(err) });
+    res.status(500).json({ error: String(err.message || err) });
+  } finally {
+    _playlistInFlight.delete(zone_id);
   }
 });
 
